@@ -121,6 +121,12 @@ impl DockItem {
         }
     }
 
+    fn next_toplevel(
+        &self
+    ) -> usize {
+        // TODO: Implement
+    }
+
     fn as_icon(
         &self,
         applet: &Context,
@@ -190,8 +196,7 @@ impl DockItem {
                 mouse_area(
                     icon_button
                         .on_press_maybe(
-                            toplevels
-                                .first()
+                            self.next_toplevel()
                                 .map(|t| Message::Activate(t.0.clone()))
                                 .or_else(|| {
                                     let gpu_idx = gpus.map(|gpus| {
@@ -206,7 +211,8 @@ impl DockItem {
                                         .exec
                                         .clone()
                                         .map(|exec| Message::Exec(exec, gpu_idx))
-                                }),
+                                }
+                            ),
                         )
                         .width(Length::Shrink)
                         .height(Length::Shrink),
@@ -631,7 +637,7 @@ impl cosmic::Application for CosmicAppList {
                 if let Some(DndOffer { dock_item, .. }) = self.dnd_offer.as_mut() {
                     if let Some(di) = cosmic::desktop::load_desktop_file(None, file_path) {
                         self.item_ctr += 1;
-                        *dock_item = Some(DockItem::new(self.item_ctr, Vec::new(), di));
+                        *dock_item = Some(DockItem::new(self.item_ctr, Vec::new(), di, 0));
                     }
                 }
             }
