@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0-only
 mod app;
+mod buffer;
+mod capture;
 mod config;
+mod dmabuf;
 mod localize;
+mod screencopy;
 mod wayland_handler;
-mod wayland_subscription;
 
 use localize::localize;
 

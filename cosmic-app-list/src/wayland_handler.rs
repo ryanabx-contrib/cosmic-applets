@@ -1,13 +1,19 @@
-use crate::wayland_subscription::{
-    ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate, WorkspaceUpdate,
-};
+use crate::capture::{Capture, CaptureFilter};
 use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs,
     os::{
         fd::{AsFd, FromRawFd, RawFd},
         unix::net::UnixStream,
     },
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex, MutexGuard},
+    thread,
 };
+
+use calloop;
+use calloop_wayland_source::WaylandSource;
 
 use cctk::{
     screencopy::{
@@ -17,12 +23,12 @@ use cctk::{
     sctk::{
         self,
         activation::{RequestData, RequestDataExt},
+        dmabuf::{DmabufFeedback, DmabufState},
         output::{OutputHandler, OutputState},
-        reexports::{calloop, calloop_wayland_source::WaylandSource},
         seat::{SeatHandler, SeatState},
         shm::{Shm, ShmHandler},
     },
-    toplevel_info::{ToplevelInfoHandler, ToplevelInfoState},
+    toplevel_info::{ToplevelInfo, ToplevelInfoHandler, ToplevelInfoState},
     toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
     wayland_client::{
         globals::registry_queue_init,
@@ -37,6 +43,7 @@ use cctk::{
     },
     workspace::{WorkspaceHandler, WorkspaceState},
 };
+use cosmic::{iced, iced_sctk::subsurface_widget::SubsurfaceBuffer};
 use cosmic_protocols::{
     image_source::v1::client::zcosmic_toplevel_image_source_manager_v1::ZcosmicToplevelImageSourceManagerV1,
     screencopy::v2::client::{
@@ -46,27 +53,38 @@ use cosmic_protocols::{
         self, State as ToplevelUpdateState, ZcosmicToplevelHandleV1,
     },
     toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
-    workspace::v1::client::zcosmic_workspace_handle_v1::State as WorkspaceUpdateState,
+    workspace::v1::client::zcosmic_workspace_handle_v1::{
+        State as WorkspaceUpdateState, ZcosmicWorkspaceHandleV1,
+    },
 };
-use futures::channel::mpsc::UnboundedSender;
+use futures::{channel::mpsc::UnboundedSender, executor::block_on, FutureExt, SinkExt};
+use futures_channel::mpsc::{self, Sender};
 use sctk::{
     activation::{ActivationHandler, ActivationState},
     registry::{ProvidesRegistryState, RegistryState},
 };
-struct AppData {
-    exit: bool,
-    tx: UnboundedSender<WaylandUpdate>,
-    conn: Connection,
-    queue_handle: QueueHandle<Self>,
-    workspace_state: WorkspaceState,
-    toplevel_info_state: ToplevelInfoState,
-    toplevel_manager_state: ToplevelManagerState,
-    screencopy_state: ScreencopyState,
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    shm_state: Shm,
-    activation_state: Option<ActivationState>,
-    output_state: OutputState,
+
+pub struct AppData {
+    pub exit: bool,
+    pub sender: Sender<WaylandUpdate>,
+    pub qh: QueueHandle<Self>,
+    pub dmabuf_state: DmabufState,
+    pub workspace_state: WorkspaceState,
+    pub toplevel_info_state: ToplevelInfoState,
+    pub toplevel_manager_state: ToplevelManagerState,
+    pub screencopy_state: ScreencopyState,
+    pub registry_state: RegistryState,
+    pub seat_state: SeatState,
+    pub shm_state: Shm,
+    pub activation_state: Option<ActivationState>,
+    pub output_state: OutputState,
+
+    pub capture_filter: CaptureFilter,
+    pub captures:
+        RefCell<HashMap<zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1, Arc<Capture>>>,
+    pub dmabuf_feedback: Option<DmabufFeedback>,
+    pub gbm: Option<(PathBuf, gbm::Device<fs::File>)>,
+    pub scheduler: calloop::futures::Scheduler<()>,
 }
 
 // Workspace and toplevel handling
@@ -114,11 +132,9 @@ impl WorkspaceHandler for AppData {
                     .state
                     .contains(&WEnum::Value(WorkspaceUpdateState::Active))
                 {
-                    let _ =
-                        self.tx
-                            .unbounded_send(WaylandUpdate::Workspace(WorkspaceUpdate::Enter(
-                                workspace.handle.clone(),
-                            )));
+                    self.send_event(WaylandUpdate::Workspace(WorkspaceUpdate::Enter(
+                        workspace.handle.clone(),
+                    )));
                     break 'workspaces_loop;
                 }
             }
@@ -134,7 +150,7 @@ impl ProvidesRegistryState for AppData {
     sctk::registry_handlers!();
 }
 
-struct ExecRequestData {
+pub struct ExecRequestData {
     data: RequestData,
     exec: String,
     gpu_idx: Option<usize>,
@@ -157,7 +173,7 @@ impl RequestDataExt for ExecRequestData {
 impl ActivationHandler for AppData {
     type RequestData = ExecRequestData;
     fn new_token(&mut self, token: String, data: &ExecRequestData) {
-        let _ = self.tx.unbounded_send(WaylandUpdate::ActivationToken {
+        self.send_event(WaylandUpdate::ActivationToken {
             token: Some(token),
             exec: data.exec.clone(),
             gpu_idx: data.gpu_idx,
@@ -220,14 +236,12 @@ impl ToplevelInfoHandler for AppData {
         toplevel: &zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
     ) {
         if let Some(info) = self.toplevel_info_state.info(toplevel) {
-            let _ = self
-                .tx
-                .unbounded_send(WaylandUpdate::Toplevel(ToplevelUpdate::Add(
-                    toplevel.clone(),
-                    info.clone(),
-                )));
-            self.send_image(toplevel.clone());
+            self.send_event(WaylandUpdate::Toplevel(ToplevelUpdate::Add(
+                toplevel.clone(),
+                info.clone(),
+            )));
         }
+        self.add_capture_source(toplevel.clone());
     }
 
     fn update_toplevel(
@@ -237,12 +251,10 @@ impl ToplevelInfoHandler for AppData {
         toplevel: &zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
     ) {
         if let Some(info) = self.toplevel_info_state.info(toplevel) {
-            let _ = self
-                .tx
-                .unbounded_send(WaylandUpdate::Toplevel(ToplevelUpdate::Update(
-                    toplevel.clone(),
-                    info.clone(),
-                )));
+            self.send_event(WaylandUpdate::Toplevel(ToplevelUpdate::Update(
+                toplevel.clone(),
+                info.clone(),
+            )));
         }
     }
 
@@ -252,271 +264,51 @@ impl ToplevelInfoHandler for AppData {
         _qh: &QueueHandle<Self>,
         toplevel: &zcosmic_toplevel_handle_v1::ZcosmicToplevelHandleV1,
     ) {
-        let _ = self
-            .tx
-            .unbounded_send(WaylandUpdate::Toplevel(ToplevelUpdate::Remove(
-                toplevel.clone(),
-            )));
-    }
-}
-
-// Screencopy handling
-
-#[derive(Default)]
-struct SessionInner {
-    formats: Option<Formats>,
-    res: Option<Result<(), WEnum<zcosmic_screencopy_frame_v2::FailureReason>>>,
-}
-
-// TODO: dmabuf? need to handle modifier negotation
-#[derive(Default)]
-struct Session {
-    condvar: Condvar,
-    inner: Mutex<SessionInner>,
-}
-
-#[derive(Default)]
-struct SessionData {
-    session: Arc<Session>,
-    session_data: ScreencopySessionData,
-}
-
-struct FrameData {
-    frame_data: ScreencopyFrameData,
-    session: zcosmic_screencopy_session_v2::ZcosmicScreencopySessionV2,
-}
-
-impl Session {
-    pub fn for_session(
-        session: &zcosmic_screencopy_session_v2::ZcosmicScreencopySessionV2,
-    ) -> Option<&Self> {
-        Some(&session.data::<SessionData>()?.session)
-    }
-
-    fn update<F: FnOnce(&mut SessionInner)>(&self, f: F) {
-        f(&mut self.inner.lock().unwrap());
-        self.condvar.notify_all();
-    }
-
-    fn wait_while<F: FnMut(&SessionInner) -> bool>(&self, mut f: F) -> MutexGuard<SessionInner> {
-        self.condvar
-            .wait_while(self.inner.lock().unwrap(), |data| f(data))
-            .unwrap()
-    }
-}
-
-impl ScreencopySessionDataExt for SessionData {
-    fn screencopy_session_data(&self) -> &ScreencopySessionData {
-        &self.session_data
-    }
-}
-
-impl ScreencopyFrameDataExt for FrameData {
-    fn screencopy_frame_data(&self) -> &ScreencopyFrameData {
-        &self.frame_data
-    }
-}
-
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for AppData {
-    fn event(
-        _app_data: &mut Self,
-        _buffer: &wl_shm_pool::WlShmPool,
-        _event: wl_shm_pool::Event,
-        _: &(),
-        _: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-impl Dispatch<wl_buffer::WlBuffer, ()> for AppData {
-    fn event(
-        _app_data: &mut Self,
-        _buffer: &wl_buffer::WlBuffer,
-        _event: wl_buffer::Event,
-        _: &(),
-        _: &Connection,
-        _qh: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-struct CaptureData {
-    qh: QueueHandle<AppData>,
-    conn: Connection,
-    wl_shm: WlShm,
-    screencopy_manager: zcosmic_screencopy_manager_v2::ZcosmicScreencopyManagerV2,
-    toplevel_source_manager: ZcosmicToplevelImageSourceManagerV1,
-}
-
-impl CaptureData {
-    pub fn capture_source_shm_fd<Fd: AsFd>(
-        &self,
-        overlay_cursor: bool,
-        source: ZcosmicToplevelHandleV1,
-        fd: Fd,
-        len: Option<u32>,
-    ) -> Option<ShmImage<Fd>> {
-        // XXX error type?
-        // TODO: way to get cursor metadata?
-
-        #[allow(unused_variables)] // TODO
-        let overlay_cursor = if overlay_cursor { 1 } else { 0 };
-
-        let session = Arc::new(Session::default());
-        let image_source = self
-            .toplevel_source_manager
-            .create_source(&source, &self.qh, ());
-        let screencopy_session = self.screencopy_manager.create_session(
-            &image_source,
-            zcosmic_screencopy_manager_v2::Options::empty(),
-            &self.qh,
-            SessionData {
-                session: session.clone(),
-                session_data: Default::default(),
-            },
-        );
-        self.conn.flush().unwrap();
-
-        let formats = session
-            .wait_while(|data| data.formats.is_none())
-            .formats
-            .take()
-            .unwrap();
-        let (width, height) = formats.buffer_size;
-
-        // XXX
-        if !formats
-            .shm_formats
-            .contains(&wl_shm::Format::Abgr8888.into())
-        {
-            tracing::error!("No suitable buffer format found");
-            tracing::warn!("Available formats: {:#?}", formats);
-            return None;
-        };
-
-        let buf_len = width * height * 4;
-        if let Some(len) = len {
-            if len != buf_len {
-                return None;
-            }
-        } else if let Err(_err) = rustix::fs::ftruncate(&fd, buf_len as _) {
-        };
-        let pool = self
-            .wl_shm
-            .create_pool(fd.as_fd(), buf_len as i32, &self.qh, ());
-        let buffer = pool.create_buffer(
-            0,
-            width as i32,
-            height as i32,
-            width as i32 * 4,
-            wl_shm::Format::Abgr8888,
-            &self.qh,
-            (),
-        );
-
-        capture(
-            &screencopy_session,
-            &buffer,
-            &[],
-            &self.qh,
-            FrameData {
-                frame_data: Default::default(),
-                session: screencopy_session.clone(),
-            },
-        );
-        self.conn.flush().unwrap();
-
-        // TODO: wait for server to release buffer?
-        let res = session
-            .wait_while(|data| data.res.is_none())
-            .res
-            .take()
-            .unwrap();
-        pool.destroy();
-        buffer.destroy();
-
-        //std::thread::sleep(std::time::Duration::from_millis(16));
-
-        if res.is_ok() {
-            Some(ShmImage { fd, width, height })
-        } else {
-            None
-        }
-    }
-}
-
-pub struct ShmImage<T: AsFd> {
-    fd: T,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl<T: AsFd> ShmImage<T> {
-    pub fn image(&self) -> anyhow::Result<image::RgbaImage> {
-        let mmap = unsafe { memmap2::Mmap::map(&self.fd.as_fd())? };
-        image::RgbaImage::from_raw(self.width, self.height, mmap.to_vec())
-            .ok_or_else(|| anyhow::anyhow!("ShmImage had incorrect size"))
+        self.send_event(WaylandUpdate::Toplevel(ToplevelUpdate::Remove(
+            toplevel.clone(),
+        )));
+        self.remove_capture_source(toplevel.clone());
     }
 }
 
 impl AppData {
-    fn send_image(&self, handle: ZcosmicToplevelHandleV1) {
-        let tx = self.tx.clone();
-        let capture_data = CaptureData {
-            qh: self.queue_handle.clone(),
-            conn: self.conn.clone(),
-            wl_shm: self.shm_state.wl_shm().clone(),
-            screencopy_manager: self.screencopy_state.screencopy_manager.clone(),
-            toplevel_source_manager: self
-                .screencopy_state
-                .toplevel_source_manager
-                .clone()
-                .unwrap(),
-        };
-        std::thread::spawn(move || {
-            use std::ffi::CStr;
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(b"app-list-screencopy\0") };
-            let Ok(fd) = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC) else {
-                tracing::error!("Failed to get fd for capture");
-                return;
-            };
+    pub fn send_event(&mut self, update: WaylandUpdate) {
+        let _ = block_on(self.sender.send(update));
+    }
 
-            // XXX is this going to use to much memory?
-            let img = capture_data.capture_source_shm_fd(false, handle.clone(), fd, None);
-            if let Some(img) = img {
-                let Ok(img) = img.image() else {
-                    tracing::error!("Failed to get RgbaImage");
-                    return;
-                };
+    fn matches_capture_filter(&self, source: &ZcosmicToplevelHandleV1) -> bool {
+        self.capture_filter.toplevels.contains(source)
+    }
 
-                // resize to 128x128
-                let max = img.width().max(img.height());
-                let ratio = max as f32 / 128.0;
-
-                let img = if ratio > 1.0 {
-                    let new_width = (img.width() as f32 / ratio).round();
-                    let new_height = (img.height() as f32 / ratio).round();
-
-                    image::imageops::resize(
-                        &img,
-                        new_width as u32,
-                        new_height as u32,
-                        image::imageops::FilterType::Lanczos3,
-                    )
-                } else {
-                    img
-                };
-
-                if let Err(err) =
-                    tx.unbounded_send(WaylandUpdate::Image(handle, WaylandImage::new(img)))
-                {
-                    tracing::error!("Failed to send image event to subscription {err:?}");
-                };
+    fn invalidate_capture_filter(&self) {
+        for (source, capture) in self.captures.borrow_mut().iter_mut() {
+            let matches = self.matches_capture_filter(source);
+            if matches {
+                capture.start(&self.screencopy_state, &self.qh);
             } else {
-                tracing::error!("Failed to capture image");
+                capture.stop();
             }
-        });
+        }
+    }
+
+    fn add_capture_source(&self, source: ZcosmicToplevelHandleV1) {
+        self.captures
+            .borrow_mut()
+            .entry(source.clone())
+            .or_insert_with(|| {
+                let matches = self.matches_capture_filter(&source);
+                let capture = Capture::new(source);
+                if matches {
+                    capture.start(&self.screencopy_state, &self.qh);
+                }
+                capture
+            });
+    }
+
+    fn remove_capture_source(&self, source: ZcosmicToplevelHandleV1) {
+        if let Some(capture) = self.captures.borrow_mut().remove(&source) {
+            capture.stop();
+        }
     }
 }
 
@@ -526,65 +318,55 @@ impl ShmHandler for AppData {
     }
 }
 
-impl ScreencopyHandler for AppData {
-    fn screencopy_state(&mut self) -> &mut ScreencopyState {
-        &mut self.screencopy_state
-    }
-
-    fn init_done(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        session: &zcosmic_screencopy_session_v2::ZcosmicScreencopySessionV2,
-        formats: &Formats,
-    ) {
-        Session::for_session(session).unwrap().update(|data| {
-            data.formats = Some(formats.clone());
-        });
-    }
-
-    fn ready(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        screencopy_frame: &zcosmic_screencopy_frame_v2::ZcosmicScreencopyFrameV2,
-        _frame: Frame,
-    ) {
-        let session = &screencopy_frame.data::<FrameData>().unwrap().session;
-        Session::for_session(session).unwrap().update(|data| {
-            data.res = Some(Ok(()));
-        });
-        session.destroy();
-    }
-
-    fn failed(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        screencopy_frame: &zcosmic_screencopy_frame_v2::ZcosmicScreencopyFrameV2,
-        reason: WEnum<zcosmic_screencopy_frame_v2::FailureReason>,
-    ) {
-        // TODO send message to thread
-        let session = &screencopy_frame.data::<FrameData>().unwrap().session;
-        Session::for_session(session).unwrap().update(|data| {
-            data.res = Some(Err(reason));
-        });
-        session.destroy();
-    }
-
-    fn stopped(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _session: &zcosmic_screencopy_session_v2::ZcosmicScreencopySessionV2,
-    ) {
-    }
+#[derive(Clone, Debug)]
+pub enum WaylandUpdate {
+    Init(calloop::channel::Sender<WaylandRequest>),
+    Finished,
+    Toplevel(ToplevelUpdate),
+    Workspace(WorkspaceUpdate),
+    ActivationToken {
+        token: Option<String>,
+        exec: String,
+        gpu_idx: Option<usize>,
+    },
+    ToplevelCapture(ZcosmicToplevelHandleV1, CaptureImage),
 }
 
-pub(crate) fn wayland_handler(
-    tx: UnboundedSender<WaylandUpdate>,
-    rx: calloop::channel::Channel<WaylandRequest>,
-) {
+#[derive(Clone, Debug)]
+pub enum ToplevelUpdate {
+    Add(ZcosmicToplevelHandleV1, ToplevelInfo),
+    Update(ZcosmicToplevelHandleV1, ToplevelInfo),
+    Remove(ZcosmicToplevelHandleV1),
+}
+
+#[derive(Clone, Debug)]
+pub enum WorkspaceUpdate {
+    Enter(ZcosmicWorkspaceHandleV1),
+}
+
+#[derive(Clone, Debug)]
+pub enum WaylandRequest {
+    Toplevel(ToplevelRequest),
+    TokenRequest {
+        app_id: String,
+        exec: String,
+        gpu_idx: Option<usize>,
+    },
+    CaptureFilter(CaptureFilter),
+}
+
+#[derive(Debug, Clone)]
+pub enum ToplevelRequest {
+    Activate(ZcosmicToplevelHandleV1),
+    Minimize(ZcosmicToplevelHandleV1),
+    Quit(ZcosmicToplevelHandleV1),
+}
+
+pub fn subscription() -> iced::Subscription<WaylandUpdate> {
+    iced::subscription::run_with_id("wayland-sub", async { start() }.flatten_stream())
+}
+
+fn start() -> mpsc::Receiver<WaylandUpdate> {
     let socket = std::env::var("X_PRIVILEGED_WAYLAND_SOCKET")
         .ok()
         .and_then(|fd| {
@@ -598,103 +380,144 @@ pub(crate) fn wayland_handler(
     } else {
         Connection::connect_to_env().unwrap()
     };
+
+    let (sender, receiver) = mpsc::channel(20);
+
     let (globals, event_queue) = registry_queue_init(&conn).unwrap();
-
-    let mut event_loop = calloop::EventLoop::<AppData>::try_new().unwrap();
     let qh = event_queue.handle();
-    let wayland_source = WaylandSource::new(conn.clone(), event_queue);
-    let handle = event_loop.handle();
-    wayland_source
-        .insert(handle.clone())
-        .expect("Failed to insert wayland source.");
 
-    if handle
-        .insert_source(rx, |event, _, state| match event {
-            calloop::channel::Event::Msg(req) => match req {
-                WaylandRequest::Screencopy(handle) => {
-                    state.send_image(handle.clone());
-                }
-                WaylandRequest::Toplevel(req) => match req {
-                    ToplevelRequest::Activate(handle) => {
-                        if let Some(seat) = state.seat_state.seats().next() {
-                            let manager = &state.toplevel_manager_state.manager;
-                            manager.activate(&handle, &seat);
+    let dmabuf_state = DmabufState::new(&globals, &qh);
+    dmabuf_state.get_default_feedback(&qh).unwrap();
+
+    thread::spawn(move || {
+        let (executor, scheduler) = calloop::futures::executor().unwrap();
+
+        let registry_state = RegistryState::new(&globals);
+        let mut app_data = AppData {
+            exit: false,
+            sender,
+            qh: qh.clone(),
+            dmabuf_state,
+            workspace_state: WorkspaceState::new(&registry_state, &qh),
+            toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
+            toplevel_manager_state: ToplevelManagerState::new(&registry_state, &qh),
+            screencopy_state: ScreencopyState::new(&globals, &qh),
+            registry_state,
+            seat_state: SeatState::new(&globals, &qh),
+            shm_state: Shm::bind(&globals, &qh).unwrap(),
+            activation_state: ActivationState::bind::<AppData>(&globals, &qh).ok(),
+            output_state: OutputState::new(&globals, &qh),
+            capture_filter: CaptureFilter::default(),
+            captures: RefCell::new(HashMap::new()),
+            dmabuf_feedback: None,
+            gbm: None,
+            scheduler,
+        };
+
+        // app_data.send_event(Event::Seats(app_data.seat_state.seats().collect()));
+        // app_data.send_event(Event::ToplevelManager(
+        //     app_data.toplevel_manager_state.manager.clone(),
+        // ));
+        // if let Ok(manager) = app_data.workspace_state.workspace_manager().get() {
+        //     app_data.send_event(Event::WorkspaceManager(manager.clone()));
+        // }
+
+        let (cmd_sender, cmd_channel) = calloop::channel::channel();
+        app_data.send_event(WaylandUpdate::Init(cmd_sender));
+
+        let mut event_loop = calloop::EventLoop::try_new().unwrap();
+        WaylandSource::new(conn, event_queue)
+            .insert(event_loop.handle())
+            .unwrap();
+        event_loop
+            .handle()
+            .insert_source(cmd_channel, |event, _, state| match event {
+                calloop::channel::Event::Msg(req) => match req {
+                    WaylandRequest::CaptureFilter(filter) => {
+                        state.capture_filter = filter;
+                        println!(
+                            "capturing '{}' toplevels",
+                            state.capture_filter.toplevels.len()
+                        );
+                        state.invalidate_capture_filter();
+                    }
+                    WaylandRequest::Toplevel(req) => match req {
+                        ToplevelRequest::Activate(handle) => {
+                            if let Some(seat) = state.seat_state.seats().next() {
+                                let manager = &state.toplevel_manager_state.manager;
+                                manager.activate(&handle, &seat);
+                            }
                         }
-                    }
-                    ToplevelRequest::Minimize(handle) => {
-                        let manager = &state.toplevel_manager_state.manager;
-                        manager.set_minimized(&handle);
-                    }
-                    ToplevelRequest::Quit(handle) => {
-                        let manager = &state.toplevel_manager_state.manager;
-                        manager.close(&handle);
-                    }
-                },
-                WaylandRequest::TokenRequest {
-                    app_id,
-                    exec,
-                    gpu_idx,
-                } => {
-                    if let Some(activation_state) = state.activation_state.as_ref() {
-                        activation_state.request_token_with_data(
-                            &state.queue_handle,
-                            ExecRequestData {
-                                data: RequestData {
-                                    app_id: Some(app_id),
-                                    seat_and_serial: state
-                                        .seat_state
-                                        .seats()
-                                        .next()
-                                        .map(|seat| (seat, 0)),
-                                    surface: None,
+                        ToplevelRequest::Minimize(handle) => {
+                            let manager = &state.toplevel_manager_state.manager;
+                            manager.set_minimized(&handle);
+                        }
+                        ToplevelRequest::Quit(handle) => {
+                            let manager = &state.toplevel_manager_state.manager;
+                            manager.close(&handle);
+                        }
+                    },
+                    WaylandRequest::TokenRequest {
+                        app_id,
+                        exec,
+                        gpu_idx,
+                    } => {
+                        if let Some(activation_state) = state.activation_state.as_ref() {
+                            activation_state.request_token_with_data(
+                                &state.qh,
+                                ExecRequestData {
+                                    data: RequestData {
+                                        app_id: Some(app_id),
+                                        seat_and_serial: state
+                                            .seat_state
+                                            .seats()
+                                            .next()
+                                            .map(|seat| (seat, 0)),
+                                        surface: None,
+                                    },
+                                    exec,
+                                    gpu_idx,
                                 },
+                            );
+                        } else {
+                            state.send_event(WaylandUpdate::ActivationToken {
+                                token: None,
                                 exec,
                                 gpu_idx,
-                            },
-                        );
-                    } else {
-                        let _ = state.tx.unbounded_send(WaylandUpdate::ActivationToken {
-                            token: None,
-                            exec,
-                            gpu_idx,
-                        });
+                            });
+                        }
                     }
+                },
+                calloop::channel::Event::Closed => {
+                    state.exit = true;
                 }
-            },
-            calloop::channel::Event::Closed => {
-                state.exit = true;
+            })
+            .unwrap();
+        event_loop
+            .handle()
+            .insert_source(executor, |(), _, _| {})
+            .unwrap();
+
+        loop {
+            if event_loop.dispatch(None, &mut app_data).is_err() {
+                eprintln!("WTF");
             }
-        })
-        .is_err()
-    {
-        return;
-    }
-    let registry_state = RegistryState::new(&globals);
-    let workspace_state = WorkspaceState::new(&registry_state, &qh); // Create before toplevel info state
-
-    let mut app_data = AppData {
-        exit: false,
-        tx,
-        conn,
-        queue_handle: qh.clone(),
-        workspace_state,
-        toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
-        toplevel_manager_state: ToplevelManagerState::new(&registry_state, &qh),
-        screencopy_state: ScreencopyState::new(&globals, &qh),
-        registry_state,
-        seat_state: SeatState::new(&globals, &qh),
-        shm_state: Shm::bind(&globals, &qh).unwrap(),
-        activation_state: ActivationState::bind::<AppData>(&globals, &qh).ok(),
-        output_state: OutputState::new(&globals, &qh),
-    };
-
-    loop {
-        if app_data.exit {
-            break;
         }
-        event_loop.dispatch(None, &mut app_data).unwrap();
-    }
+    });
+
+    receiver
 }
+
+// NEW SCREENCOPY STUFF
+
+#[derive(Clone, Debug)]
+pub struct CaptureImage {
+    pub width: u32,
+    pub height: u32,
+    pub wl_buffer: SubsurfaceBuffer,
+}
+
+// END NEW SCREENCOPY STUFF
 
 sctk::delegate_seat!(AppData);
 sctk::delegate_registry!(AppData);
@@ -702,7 +525,6 @@ sctk::delegate_shm!(AppData);
 cctk::delegate_toplevel_info!(AppData);
 cctk::delegate_workspace!(AppData);
 cctk::delegate_toplevel_manager!(AppData);
-cctk::delegate_screencopy!(AppData, session: [SessionData], frame: [FrameData]);
 
 sctk::delegate_activation!(AppData, ExecRequestData);
 

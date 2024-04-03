@@ -2,19 +2,18 @@ use crate::config;
 use crate::config::AppListConfig;
 use crate::config::APP_ID;
 use crate::fl;
-use crate::wayland_subscription::wayland_subscription;
-use crate::wayland_subscription::ToplevelRequest;
-use crate::wayland_subscription::ToplevelUpdate;
-use crate::wayland_subscription::WaylandImage;
-use crate::wayland_subscription::WaylandRequest;
-use crate::wayland_subscription::WaylandUpdate;
-use crate::wayland_subscription::WorkspaceUpdate;
-use cctk::sctk::reexports::calloop::channel::Sender;
+use crate::wayland_handler::CaptureImage;
+use crate::wayland_handler::ToplevelRequest;
+use crate::wayland_handler::ToplevelUpdate;
+use crate::wayland_handler::WaylandRequest;
+use crate::wayland_handler::WaylandUpdate;
+use crate::wayland_handler::WorkspaceUpdate;
+use calloop::channel::Sender;
 use cctk::toplevel_info::ToplevelInfo;
 use cctk::wayland_client::protocol::wl_data_device_manager::DndAction;
 use cctk::wayland_client::protocol::wl_seat::WlSeat;
+use cctk::wayland_client::Connection;
 use cosmic::cosmic_config::{Config, CosmicConfigEntry};
-use cosmic::desktop::IconSource;
 use cosmic::desktop::{
     app_id_or_fallback_matches, load_applications_for_app_ids, DesktopEntryData,
 };
@@ -40,6 +39,7 @@ use cosmic::iced_sctk::commands::data_device::finish_dnd;
 use cosmic::iced_sctk::commands::data_device::request_dnd_data;
 use cosmic::iced_sctk::commands::data_device::set_actions;
 use cosmic::iced_sctk::commands::data_device::start_drag;
+use cosmic::iced_sctk::subsurface_widget::Subsurface;
 use cosmic::iced_style::application;
 use cosmic::theme::Button;
 use cosmic::theme::Container;
@@ -75,11 +75,13 @@ use std::str::FromStr;
 use std::time::Duration;
 use switcheroo_control::Gpu;
 use tokio::time::sleep;
+use tracing_log::log;
 use url::Url;
 
 static MIME_TYPE: &str = "text/uri-list";
 
 pub fn run() -> cosmic::iced::Result {
+    println!("RUNNING APP LIST APPLET");
     cosmic::applet::run::<CosmicAppList>(true, ())
 }
 
@@ -108,7 +110,7 @@ pub fn load_applications_for_app_ids_sorted<'a, 'b>(
 #[derive(Debug, Clone, Default)]
 struct DockItem {
     id: u32,
-    toplevels: Vec<(ZcosmicToplevelHandleV1, ToplevelInfo, Option<WaylandImage>)>,
+    toplevels: Vec<(ZcosmicToplevelHandleV1, ToplevelInfo, Option<CaptureImage>)>,
     desktop_info: DesktopEntryData,
 }
 
@@ -131,7 +133,7 @@ impl DataFromMimeType for DockItem {
 impl DockItem {
     fn new(
         id: u32,
-        toplevels: Vec<(ZcosmicToplevelHandleV1, ToplevelInfo, Option<WaylandImage>)>,
+        toplevels: Vec<(ZcosmicToplevelHandleV1, ToplevelInfo, Option<CaptureImage>)>,
         desktop_info: DesktopEntryData,
     ) -> Self {
         Self {
@@ -325,7 +327,7 @@ struct CosmicAppList {
 #[derive(Clone, PartialEq)]
 pub enum PopupType {
     RightClickMenu,
-    TopLevelList,
+    TopLevelList(Vec<ZcosmicToplevelHandleV1>),
 }
 
 // TODO DnD after sctk merges DnD
@@ -426,55 +428,42 @@ pub fn menu_button<'a, Message>(
         .width(Length::Fill)
 }
 
+fn capture_image(image: Option<&CaptureImage>) -> cosmic::Element<'_, Message> {
+    if let Some(image) = image {
+        Subsurface::new(image.width, image.height, &image.wl_buffer).into()
+    } else {
+        Image::new(Handle::from_pixels(1, 1, vec![0, 0, 0, 255])).into()
+    }
+}
+
 const TOPLEVEL_BUTTON_WIDTH: f32 = 160.0;
 const TOPLEVEL_BUTTON_HEIGHT: f32 = 130.0;
 
-pub fn toplevel_button<'a, Msg>(
-    img: Option<WaylandImage>,
-    icon: &IconSource,
-    on_press: Msg,
+fn toplevel_button(
+    img: &Option<CaptureImage>,
+    on_press: Message,
     title: String,
     text_size: f32,
     is_focused: bool,
-) -> cosmic::widget::Button<'a, Msg, cosmic::Theme, cosmic::Renderer>
-where
-    Msg: 'static + Clone,
-{
+) -> cosmic::widget::Button<'_, Message, cosmic::Theme, cosmic::Renderer> {
     let border = 1.0;
     cosmic::widget::Button::new(
         container(
             column![
-                container(if let Some(img) = img {
-                    Element::from(
-                        Image::new(Handle::from_pixels(
-                            img.img.width(),
-                            img.img.height(),
-                            img.clone(),
-                        ))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(cosmic::iced_core::ContentFit::Contain),
-                    )
-                } else {
-                    Element::from(
-                        icon.as_cosmic_icon()
-                            .width(Length::Fill)
-                            .height(Length::Fill),
-                    )
-                })
-                .style(Container::Custom(Box::new(move |theme| {
-                    container::Appearance {
-                        border: Border {
-                            color: theme.cosmic().bg_divider().into(),
-                            width: border,
-                            radius: 0.0.into(),
-                        },
-                        ..Default::default()
-                    }
-                })))
-                .padding(border as u16)
-                .height(Length::Fill)
-                .width(Length::Fill),
+                container(capture_image(None)/*capture_image(img.as_ref())*/)
+                    .style(Container::Custom(Box::new(move |theme| {
+                        container::Appearance {
+                            border: Border {
+                                color: theme.cosmic().bg_divider().into(),
+                                width: border,
+                                radius: 0.0.into(),
+                            },
+                            ..Default::default()
+                        }
+                    })))
+                    .padding(border as u16)
+                    .height(Length::Fill)
+                    .width(Length::Fill),
                 container(
                     text(title)
                         .size(text_size)
@@ -661,19 +650,25 @@ impl cosmic::Application for CosmicAppList {
                     .chain(self.favorite_list.iter())
                     .find(|t| t.desktop_info.id == id)
                 {
-                    for (ref handle, _, _) in &toplevel_group.toplevels {
-                        if let Some(tx) = self.wayland_sender.as_ref() {
-                            let _ = tx.send(WaylandRequest::Screencopy(handle.clone()));
-                        }
-                    }
-
                     let rectangle = match self.rectangles.get(&toplevel_group.id) {
                         Some(r) => r,
                         None => return Command::none(),
                     };
 
                     let new_id = window::Id::unique();
-                    self.popup = Some((new_id, toplevel_group.id, PopupType::TopLevelList));
+                    self.popup = Some((
+                        new_id,
+                        toplevel_group.id,
+                        PopupType::TopLevelList(
+                            toplevel_group
+                                .toplevels
+                                .iter()
+                                .map(|(x, _, _)| x.clone())
+                                .collect(),
+                        ),
+                    ));
+
+                    self.update_capture_filter();
 
                     let mut popup_settings = self.core.applet.get_popup_settings(
                         window::Id::MAIN,
@@ -970,7 +965,7 @@ impl cosmic::Application for CosmicAppList {
                     WaylandUpdate::Init(tx) => {
                         self.wayland_sender.replace(tx);
                     }
-                    WaylandUpdate::Image(handle, img) => {
+                    WaylandUpdate::ToplevelCapture(handle, img) => {
                         'img_update: for x in self
                             .active_list
                             .iter_mut()
@@ -1172,6 +1167,7 @@ impl cosmic::Application for CosmicAppList {
             Message::CloseRequested(id) => {
                 if Some(id) == self.popup.as_ref().map(|p| p.0) {
                     self.popup = None;
+                    // self.update_capture_filter();
                 }
             }
             Message::GpuRequest(gpus) => {
@@ -1461,7 +1457,7 @@ impl cosmic::Application for CosmicAppList {
                     };
                     self.core.applet.popup_container(content).into()
                 }
-                PopupType::TopLevelList => match self.core.applet.anchor {
+                PopupType::TopLevelList(_) => match self.core.applet.anchor {
                     PanelAnchor::Left | PanelAnchor::Right => {
                         let mut content = column![]
                             .padding(8)
@@ -1474,8 +1470,7 @@ impl cosmic::Application for CosmicAppList {
                                 info.title.clone()
                             };
                             content = content.push(toplevel_button(
-                                img.clone(),
-                                &desktop_info.icon,
+                                img,
                                 Message::Toggle(handle.clone()),
                                 title,
                                 10.0,
@@ -1495,8 +1490,7 @@ impl cosmic::Application for CosmicAppList {
                                 info.title.clone()
                             };
                             content = content.push(toplevel_button(
-                                img.clone(),
-                                &desktop_info.icon,
+                                img,
                                 Message::Toggle(handle.clone()),
                                 title,
                                 10.0,
@@ -1519,7 +1513,7 @@ impl cosmic::Application for CosmicAppList {
 
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch(vec![
-            wayland_subscription().map(Message::Wayland),
+            crate::wayland_handler::subscription().map(Message::Wayland),
             listen_with(|e, _| match e {
                 cosmic::iced_runtime::core::Event::PlatformSpecific(
                     event::PlatformSpecific::Wayland(event::wayland::Event::Seat(e, seat)),
@@ -1589,5 +1583,18 @@ impl CosmicAppList {
             }
         }
         None
+    }
+
+    fn update_capture_filter(&self) {
+        println!("UPDATING CAPTURE FILTER");
+        if let Some(sender) = self.wayland_sender.as_ref() {
+            let mut capture_filter = crate::capture::CaptureFilter::default();
+            if let Some((_, _, PopupType::TopLevelList(toplevels))) = self.popup.as_ref() {
+                capture_filter.toplevels = toplevels.clone();
+            } else {
+                capture_filter.toplevels = Vec::new();
+            }
+            let _ = sender.send(WaylandRequest::CaptureFilter(capture_filter));
+        }
     }
 }

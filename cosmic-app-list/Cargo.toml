@@ -6,9 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
 anyhow.workspace = true
+calloop = { version = "0.13.0", features = ["executor"] }
+calloop-wayland-source = "0.3.0"
+gbm = "0.14.0"
 cctk.workspace = true
 cosmic-protocols.workspace = true
 futures.workspace = true
+futures-channel = "0.3.25"
 i18n-embed.workspace = true
 i18n-embed-fl.workspace = true
 image = { version = "0.25.0", default-features = false }
@@ -26,4 +30,5 @@ tracing-log.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 url = "2.5.0"
+wayland-protocols = "0.31.0"
 zbus.workspace = true
