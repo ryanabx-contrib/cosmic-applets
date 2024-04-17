@@ -959,6 +959,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmic-applet-combo"
+version = "0.1.0"
+dependencies = [
+ "libcosmic",
+]
+
+[[package]]
 name = "cosmic-applet-minimize"
 version = "0.1.1"
 dependencies = [
