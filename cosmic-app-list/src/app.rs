@@ -196,17 +196,17 @@ impl DockItem {
         } else {
             (0..1)
                 .map(|_| {
-                    container(if toplevels.len() == 1 {
-                        vertical_space(Length::Fixed(0.0))
-                    } else {
-                        match applet.anchor {
-                            PanelAnchor::Left | PanelAnchor::Right => {
-                                vertical_space(app_icon.bar_size)
-                            }
-                            PanelAnchor::Top | PanelAnchor::Bottom => {
-                                horizontal_space(app_icon.bar_size)
-                            }
-                        }
+                    container(match applet.anchor {
+                        PanelAnchor::Left | PanelAnchor::Right => vertical_space(
+                            app_icon.bar_size
+                                * if is_focused { 2.0 } else { 0.75 }
+                                * if toplevels.len() == 1 { 1.0 } else { 1.25 },
+                        ),
+                        PanelAnchor::Top | PanelAnchor::Bottom => horizontal_space(
+                            app_icon.bar_size
+                                * if is_focused { 2.0 } else { 0.75 }
+                                * if toplevels.len() == 1 { 1.0 } else { 1.25 },
+                        ),
                     })
                     .padding(app_icon.dot_radius)
                     .style(<Theme as container::StyleSheet>::Style::Custom(Box::new(
@@ -233,7 +233,7 @@ impl DockItem {
 
         let icon_wrapper: Element<_> = match applet.anchor {
             PanelAnchor::Left => row(vec![
-                column(dots).into(),
+                column(dots).spacing(2).into(),
                 horizontal_space(Length::Fixed(1.0)).into(),
                 cosmic_icon.into(),
             ])
@@ -242,12 +242,12 @@ impl DockItem {
             PanelAnchor::Right => row(vec![
                 cosmic_icon.into(),
                 horizontal_space(Length::Fixed(1.0)).into(),
-                column(dots).into(),
+                column(dots).spacing(2).into(),
             ])
             .align_items(iced::Alignment::Center)
             .into(),
             PanelAnchor::Top => column(vec![
-                row(dots).into(),
+                row(dots).spacing(2).into(),
                 vertical_space(Length::Fixed(1.0)).into(),
                 cosmic_icon.into(),
             ])
@@ -256,7 +256,7 @@ impl DockItem {
             PanelAnchor::Bottom => column(vec![
                 cosmic_icon.into(),
                 vertical_space(Length::Fixed(1.0)).into(),
-                row(dots).into(),
+                row(dots).spacing(2).into(),
             ])
             .align_items(iced::Alignment::Center)
             .into(),
