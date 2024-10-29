@@ -197,14 +197,21 @@ impl DockItem {
             (0..1)
                 .map(|_| {
                     container(if toplevels.len() == 1 {
-                        vertical_space(Length::Fixed(0.0))
-                    } else {
                         match applet.anchor {
                             PanelAnchor::Left | PanelAnchor::Right => {
                                 vertical_space(app_icon.bar_size)
                             }
                             PanelAnchor::Top | PanelAnchor::Bottom => {
                                 horizontal_space(app_icon.bar_size)
+                            }
+                        }
+                    } else {
+                        match applet.anchor {
+                            PanelAnchor::Left | PanelAnchor::Right => {
+                                vertical_space(app_icon.bar_size * 2.0)
+                            }
+                            PanelAnchor::Top | PanelAnchor::Bottom => {
+                                horizontal_space(app_icon.bar_size * 2.0)
                             }
                         }
                     })
